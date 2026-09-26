@@ -1,5 +1,6 @@
-"""Comandos reproduzíveis para tarefas periódicas — a partir da Fase 2 (vazio na Fase 1).
+"""Comandos reproduzíveis para tarefas periódicas (ARCHITECTURE.md §7).
 
-Requisitos (ARCHITECTURE.md §7): trava contra execução simultânea e registro de início, fim,
-linhas aceitas/rejeitadas e erros.
+- `import_csv.py` — importa um CSV (`python -m product_intelligence.jobs.import_csv`),
+  com trava no PostgreSQL contra execução simultânea e resumo de linhas aceitas,
+  duplicadas e rejeitadas.
 """

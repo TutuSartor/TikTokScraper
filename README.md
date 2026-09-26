@@ -2,7 +2,7 @@
 
 Sistema pessoal para registrar candidatos a produto, suas fontes e evidências datadas, e apoiar a triagem para testes numa loja Shopify voltada aos EUA. O desenho completo está em [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Estado atual: Fase 1 concluída; Fase 2 em andamento.** Existem projeto Python, Docker Compose com PostgreSQL, FastAPI com `/health`, Alembic, configuração por `.env`, testes, scripts de backup e o **esquema do banco da Fase 2** (migrações `0002` e `0003`). Ainda **não** há rotas CRUD, importação CSV, coleta TikTok, dashboard nem score.
+**Estado atual: Fase 1 concluída; Fase 2 em andamento.** Existem projeto Python, Docker Compose com PostgreSQL, FastAPI com `/health`, Alembic, configuração por `.env`, testes, scripts de backup e o **esquema do banco da Fase 2** (migrações `0002` e `0003`). Também já existe a **importação CSV** (`ingest/` e `jobs/import_csv.py`). Ainda **não** há rotas CRUD, coleta TikTok, dashboard nem score.
 
 ## Estrutura
 
@@ -20,9 +20,9 @@ Sistema pessoal para registrar candidatos a produto, suas fontes e evidências d
 │   ├── config.py           # Settings (DATABASE_URL, APP_ENV, LOG_LEVEL)
 │   ├── api/                # routers — Fase 1: health.py
 │   ├── db/                 # Base, engine/sessão, models.py (tabelas) e enums.py (vocabulários)
-│   ├── ingest/             # Fase 2 (vazio)
+│   ├── ingest/             # importação CSV: urls.py, rows.py, importer.py
 │   ├── analytics/          # Fases 3–4 (vazio)
-│   └── jobs/               # Fase 2+ (vazio)
+│   └── jobs/               # comandos: import_csv.py
 ├── migrations/             # Alembic — 0001_baseline, 0002_domain_tables, 0003_observation_integrity
 ├── scripts/                # backup.sh / restore.sh
 └── tests/                  # health, config, backup, migrações e integridade do esquema
@@ -107,7 +107,45 @@ Datas fornecidas aos modelos precisam incluir fuso horário (`Z` ou offset, por 
 
 Ao atualizar uma VM com `0002` já aplicada, faça backup e execute `alembic upgrade head` (ou reconstrua a API pelo Compose). A migração falha se houver registros antigos sem proveniência completa ou com região incompatível; ela não inventa valores nem apaga dados para satisfazer as regras.
 
-Para concluir a Fase 2 ainda faltam as rotas de candidatos, fontes e observações, associação candidato/fonte, importação CSV idempotente com erros por linha e cadastro manual de candidatos reais. As tabelas de fornecedor, review e score são apenas estrutura para fases futuras.
+Para concluir a Fase 2 ainda faltam as rotas de candidatos, fontes e observações, associação candidato/fonte e cadastro manual de candidatos reais. As tabelas de fornecedor, review e score são apenas estrutura para fases futuras.
+
+## Importação CSV
+
+O arquivo precisa estar em **UTF-8** (no Excel: "CSV UTF-8"), separado por vírgulas, com cabeçalho na linha 1. Há um modelo vazio em [`docs/import_template.csv`](docs/import_template.csv).
+
+```bash
+# Na VM, a partir da pasta do projeto. 1) simular (não grava nada):
+docker compose exec -T api python -m product_intelligence.jobs.import_csv - \
+    --name lote_2026-09-26.csv --dry-run < lote_2026-09-26.csv
+# 2) importar de verdade:
+docker compose exec -T api python -m product_intelligence.jobs.import_csv - \
+    --name lote_2026-09-26.csv < lote_2026-09-26.csv
+```
+
+Saída: 0 = tudo aceito ou já existente; 2 = algumas linhas rejeitadas (as outras foram gravadas); 1 = arquivo recusado ou falha, sem dados de domínio importados; 3 = outra importação em andamento. Arquivos recusados durante o processamento geram um lote `failed` para auditoria. Falhas de leitura, limite de tamanho excedido no comando e banco indisponível não geram lote.
+
+| Coluna | Obrigatória | Formato |
+|---|---|---|
+| `product_name` | sim | até 200 caracteres |
+| `source_type` | sim | `tiktok_top_ads`, `tiktok_top_products`, `tiktok_video`, `supplier`, `other` |
+| `source_url` | sim | `http(s)://…` |
+| `observed_at` | sim | ISO 8601 **com fuso**: `2026-09-26T12:00:00Z` ou `2026-09-26T09:00:00-03:00` |
+| `market_region` | não | 2 letras, ex. `US` |
+| `region_basis` | não (padrão `unknown`) | `source_filter_us` (exige `market_region=US`), `declared_creator`, `language_only`, `unknown`, `other` |
+| `views`, `likes`, `comments_count`, `shares` | não | inteiro só com dígitos (`120000`); **não** use `1.2K` nem `1,200` |
+| `observed_price_usd` | não | `19.99` — ponto decimal, sem `$` |
+| `product_id` | não | id de um candidato existente, para desfazer ambiguidade de nome |
+| `product_category`, `relation`, `external_id`, `title`, `creator_handle`, `published_at`, `note` | não | `relation`: `shows_product` (padrão), `similar_product`, `supplier_listing`, `other` |
+
+Regras:
+
+- **Célula vazia = desconhecido** (`NULL`), nunca zero. Linhas totalmente vazias são ignoradas.
+- **Idempotente:** reimportar o mesmo arquivo não duplica nada; as linhas aparecem como "duplicadas". Cada execução fica registrada em `import_batch`.
+- **Uma observação por fonte e instante.** Mesma fonte + mesmo `observed_at` com os mesmos valores, incluindo `note`, é duplicada; com valores diferentes é rejeitada (observações são imutáveis). Para um novo snapshot, use outro `observed_at`. Relação candidato/fonte conflitante também é rejeitada e exige revisão manual.
+- **Candidato:** reaproveitado só quando o nome é idêntico (ignorando maiúsculas e espaços repetidos). Nomes parecidos viram candidatos diferentes; se houver dois candidatos com o mesmo nome, informe `product_id`.
+- **Fonte:** reaproveitada pela URL normalizada (domínio em minúsculas, sem âncoras simples nem `utm_*`/`fbclid`/`gclid`). Ordem e codificação dos parâmetros são preservadas, pois podem identificar recursos ou assinaturas diferentes. Rotas de aplicações (`#/…`, `#!/…`, `#?…`) e parâmetros do TikTok são mantidos. Metadados (`title` etc.) só preenchem campos vazios; nunca sobrescrevem. Se houver possível conflito com a normalização antiga, a linha exige revisão manual da URL original em vez de unir ou duplicar fontes automaticamente.
+- **Erros por linha** ficam em `import_row_error` com o conteúdo original. A referência é a linha física onde o registro começa, incluindo linhas vazias e campos multilinha. Células com NUL são rejeitadas e guardadas como `{"encoding": "base64-utf8", "value": "…"}` em `raw_row`, pois JSONB não aceita esse caractere; a codificação permite recuperar o original.
+- Cabeçalho com coluna desconhecida ou obrigatória ausente, arquivo fora de UTF-8 ou CSV malformado: o arquivo inteiro é recusado, sem candidatos/fontes/observações gravados; apenas o lote de falha fica registrado. O limite é 20 MB por arquivo e o comando limita a leitura antes de carregá-lo inteiro.
 
 ## 4. Testes
 
@@ -168,7 +206,7 @@ Ver [ARCHITECTURE.md §8](ARCHITECTURE.md#8-fases-de-entrega). Resumo do que cad
 
 | Fase | Onde |
 |---|---|
-| 2 — Dados reais | ✅ esquema (`db/models.py`, `0002`) · pendente: `api/` (CRUD), `ingest/` (CSV idempotente), `jobs/` |
+| 2 — Dados reais | ✅ esquema (`db/models.py`, `0002`, `0003`) · ✅ importação CSV (`ingest/`, `jobs/import_csv.py`) · pendente: `api/` (CRUD) |
 | 3 — Histórico | `analytics/` (variação entre snapshots, cobertura) e rotas de consulta |
 | 4 — Triagem | `analytics/` (score versionado), reviews, ofertas de fornecedor |
 | 5 — Interface | dashboard e conectores autorizados |
