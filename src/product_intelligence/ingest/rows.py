@@ -210,38 +210,20 @@ def parse_row(raw: dict[str, str], now: datetime | None = None) -> ParsedRow:
         attempt("region_basis", lambda: _parse_enum(RegionBasis, v, "region_basis"))
 
     if (v := _text(raw, "market_region")) is not None:
-        region = v.upper()
-        if _REGION.fullmatch(region):
-            values["market_region"] = region
-        else:
-            errors.append(f"market_region: '{v}' deve ter 2 letras (ex.: US)")
+        attempt("market_region", lambda: parse_region(v))
 
-    if (
-        values.get("region_basis") == RegionBasis.SOURCE_FILTER_US
-        and values.get("market_region") != "US"
-        and "market_region" not in {e.split(":")[0] for e in errors}
-    ):
-        errors.append("region_basis=source_filter_us exige market_region=US")
+    if "market_region" not in {e.split(":")[0] for e in errors}:
+        try:
+            check_region_basis(values.get("region_basis"), values.get("market_region"))
+        except ValueError as exc:
+            errors.append(str(exc))
 
     for column in ("views", "likes", "comments_count", "shares"):
         if (v := _text(raw, column)) is not None:
             attempt(column, lambda v=v, column=column: _parse_count(v, column))
 
     if (v := _text(raw, "observed_price_usd")) is not None:
-        def price():
-            if not _PRICE.fullmatch(v):
-                raise ValueError(
-                    f"observed_price_usd: '{v}' deve ser número ≥ 0 com até 2 casas "
-                    "e ponto decimal, sem símbolo (ex.: 19.99)"
-                )
-            try:
-                amount = Decimal(v)
-            except InvalidOperation:
-                raise ValueError(f"observed_price_usd: '{v}' inválido") from None
-            if amount >= Decimal("10000000000"):
-                raise ValueError(f"observed_price_usd: '{v}' grande demais")
-            return amount
-        attempt("observed_price_usd", price)
+        attempt("observed_price_usd", lambda: parse_price(v))
 
     if errors:
         raise RowError(errors)
@@ -271,3 +253,52 @@ def parse_row(raw: dict[str, str], now: datetime | None = None) -> ParsedRow:
 
 def _raise_zero_id() -> int:
     raise ValueError("product_id: deve ser ≥ 1")
+
+
+# ---------- validadores por campo (usados pelo CSV e pela API) ----------
+
+MAX_LENGTHS = _MAX_LENGTHS
+
+
+def parse_datetime(value: str, column: str, now: datetime | None = None) -> datetime:
+    """ISO 8601 com fuso, convertido para UTC; recusa datas no futuro."""
+    return _parse_datetime(value, column, now or datetime.now(UTC))
+
+
+def parse_count(value: str, column: str) -> int:
+    """Inteiro ≥ 0 escrito só com dígitos ("1.2K", "1,200", "-5" são recusados)."""
+    return _parse_count(value, column)
+
+
+def parse_enum(enum_cls: type[E], value: str, column: str) -> E:
+    return _parse_enum(enum_cls, value, column)
+
+
+def parse_region(value: str, column: str = "market_region") -> str:
+    """Duas letras; minúsculas são aceitas e convertidas ("us" → "US")."""
+    region = value.strip().upper()
+    if not _REGION.fullmatch(region):
+        raise ValueError(f"{column}: '{value}' deve ter 2 letras (ex.: US)")
+    return region
+
+
+def parse_price(value: str, column: str = "observed_price_usd") -> Decimal:
+    """Número ≥ 0 com até 2 casas, ponto decimal, sem símbolo de moeda."""
+    if not _PRICE.fullmatch(value):
+        raise ValueError(
+            f"{column}: '{value}' deve ser número ≥ 0 com até 2 casas "
+            "e ponto decimal, sem símbolo (ex.: 19.99)"
+        )
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        raise ValueError(f"{column}: '{value}' inválido") from None
+    if amount >= Decimal("10000000000"):
+        raise ValueError(f"{column}: '{value}' grande demais")
+    return amount
+
+
+def check_region_basis(region_basis: RegionBasis | None, market_region: str | None) -> None:
+    """Filtro "United States" na fonte só vale com market_region=US."""
+    if region_basis == RegionBasis.SOURCE_FILTER_US and market_region != "US":
+        raise ValueError("region_basis=source_filter_us exige market_region=US")

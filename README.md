@@ -2,7 +2,7 @@
 
 Sistema pessoal para registrar candidatos a produto, suas fontes e evidências datadas, e apoiar a triagem para testes numa loja Shopify voltada aos EUA. O desenho completo está em [ARCHITECTURE.md](ARCHITECTURE.md).
 
-**Estado atual: Fase 1 concluída; Fase 2 em andamento.** Existem projeto Python, Docker Compose com PostgreSQL, FastAPI com `/health`, Alembic, configuração por `.env`, testes, scripts de backup e o **esquema do banco da Fase 2** (migrações `0002` e `0003`). Também já existe a **importação CSV** (`ingest/` e `jobs/import_csv.py`). Ainda **não** há rotas CRUD, coleta TikTok, dashboard nem score.
+**Estado atual: Fase 1 concluída; Fase 2 em andamento.** Existem projeto Python, Docker Compose com PostgreSQL, FastAPI com `/health`, Alembic, configuração por `.env`, testes, scripts de backup e o **esquema do banco da Fase 2** (migrações `0002` e `0003`). Também já existem a **importação CSV** (`ingest/` e `jobs/import_csv.py`) e as **rotas da API** para candidatos, fontes e observações (`api/`). Ainda **não** há coleta TikTok, dashboard nem score.
 
 ## Estrutura
 
@@ -18,7 +18,8 @@ Sistema pessoal para registrar candidatos a produto, suas fontes e evidências d
 ├── src/product_intelligence/
 │   ├── main.py             # create_app() / app
 │   ├── config.py           # Settings (DATABASE_URL, APP_ENV, LOG_LEVEL)
-│   ├── api/                # routers — Fase 1: health.py
+│   ├── domain.py           # regras de gravação comuns à API e ao CSV
+│   ├── api/                # rotas: health, candidates, sources (+ schemas, deps)
 │   ├── db/                 # Base, engine/sessão, models.py (tabelas) e enums.py (vocabulários)
 │   ├── ingest/             # importação CSV: urls.py, rows.py, importer.py
 │   ├── analytics/          # Fases 3–4 (vazio)
@@ -107,7 +108,7 @@ Datas fornecidas aos modelos precisam incluir fuso horário (`Z` ou offset, por 
 
 Ao atualizar uma VM com `0002` já aplicada, faça backup e execute `alembic upgrade head` (ou reconstrua a API pelo Compose). A migração falha se houver registros antigos sem proveniência completa ou com região incompatível; ela não inventa valores nem apaga dados para satisfazer as regras.
 
-Para concluir a Fase 2 ainda faltam as rotas de candidatos, fontes e observações, associação candidato/fonte e cadastro manual de candidatos reais. As tabelas de fornecedor, review e score são apenas estrutura para fases futuras.
+Para concluir a Fase 2 falta o cadastro de candidatos reais (pela API ou por CSV). As tabelas de fornecedor, review e score são apenas estrutura para fases futuras.
 
 ## Importação CSV
 
@@ -146,6 +147,44 @@ Regras:
 - **Fonte:** reaproveitada pela URL normalizada (domínio em minúsculas, sem âncoras simples nem `utm_*`/`fbclid`/`gclid`). Ordem e codificação dos parâmetros são preservadas, pois podem identificar recursos ou assinaturas diferentes. Rotas de aplicações (`#/…`, `#!/…`, `#?…`) e parâmetros do TikTok são mantidos. Metadados (`title` etc.) só preenchem campos vazios; nunca sobrescrevem. Se houver possível conflito com a normalização antiga, a linha exige revisão manual da URL original em vez de unir ou duplicar fontes automaticamente.
 - **Erros por linha** ficam em `import_row_error` com o conteúdo original. A referência é a linha física onde o registro começa, incluindo linhas vazias e campos multilinha. Células com NUL são rejeitadas e guardadas como `{"encoding": "base64-utf8", "value": "…"}` em `raw_row`, pois JSONB não aceita esse caractere; a codificação permite recuperar o original.
 - Cabeçalho com coluna desconhecida ou obrigatória ausente, arquivo fora de UTF-8 ou CSV malformado: o arquivo inteiro é recusado, sem candidatos/fontes/observações gravados; apenas o lote de falha fica registrado. O limite é 20 MB por arquivo e o comando limita a leitura antes de carregá-lo inteiro.
+
+## API
+
+Com a API no ar, a documentação interativa (para testar cada rota pelo navegador) fica em `http://127.0.0.1:8000/docs`. Na VM, acesse pelo túnel SSH descrito em [Segurança](#segurança).
+
+| Rota | O que faz |
+|---|---|
+| `POST /candidates` · `GET /candidates?q=&status=` · `GET/PATCH/DELETE /candidates/{id}` | Cadastro de candidatos. `GET /candidates/{id}` traz as fontes associadas. |
+| `POST /candidates/{id}/sources` | Associa uma fonte ao candidato: por `source_id` ou por `source_type` + `url` (cria a fonte se não existir). |
+| `PATCH /candidates/{id}/sources/{source_id}` · `DELETE …` | Revisão manual da associação (`relation`, `reviewed: true/false`) ou desassociação. |
+| `POST /sources` · `GET /sources?source_type=&candidate_id=` · `GET/PATCH/DELETE /sources/{id}` | Cadastro de fontes. `GET /sources/{id}` traz candidatos, total de observações e a mais recente. |
+| `POST /sources/{id}/observations` · `GET /sources/{id}/observations` | Registra um snapshot manual; lista em ordem cronológica. |
+| `GET /observations/{id}` | Consulta uma observação. Não existe edição nem exclusão. |
+
+Listas aceitam `limit` (1–200, padrão 50) e `offset` e devolvem `{items, total, limit, offset}`.
+
+**Mesmas regras da importação CSV** — toda gravação passa por `product_intelligence/domain.py`, e cada campo é validado pelos mesmos validadores de `ingest/rows.py`:
+
+- datas como texto ISO 8601 **com fuso** (`"2026-09-26T09:00:00-03:00"`), gravadas e devolvidas em UTC; datas futuras são recusadas;
+- contagens inteiras ≥ 0 (`120000` ou `"120000"`; `"1.2K"`, `1.5` e `true` são recusados); preço com até 2 casas (`"19.99"`); região com 2 letras (`"us"` vira `"US"`); `source_filter_us` exige `US`;
+- campo ausente ou `null` = desconhecido, nunca zero; campos desconhecidos no JSON são recusados (422);
+- URL normalizada da mesma forma; fonte já existente é devolvida (200) e só tem campos vazios completados; fonte gravada com a normalização antiga bloqueia o cadastro (409);
+- nome de candidato idêntico a outro (ignorando maiúsculas e espaços) é recusado (409), para o CSV nunca ficar ambíguo; nomes parecidos são permitidos;
+- observação no mesmo instante: valores iguais = devolve a existente (200); diferentes = 409;
+- o `status` do candidato não é editável por aqui: ele mudará por review (Fase 4).
+
+Códigos: 201 criado · 200 já existia/consultado · 204 apagado · 404 não encontrado · 405 operação não permitida (editar/apagar observação) · 409 conflito com dado gravado ou histórico que impede exclusão · 422 entrada inválida (`detail` lista os motivos).
+
+Exemplo pelo terminal da VM:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/candidates -H 'Content-Type: application/json' \
+  -d '{"name": "Pet hair remover", "category": "Pets"}'
+curl -s -X POST http://127.0.0.1:8000/candidates/1/sources -H 'Content-Type: application/json' \
+  -d '{"source_type": "tiktok_top_ads", "url": "https://..."}'
+curl -s -X POST http://127.0.0.1:8000/sources/1/observations -H 'Content-Type: application/json' \
+  -d '{"observed_at": "2026-09-26T09:00:00-03:00", "views": 120000, "market_region": "US", "region_basis": "source_filter_us"}'
+```
 
 ## 4. Testes
 
@@ -206,7 +245,7 @@ Ver [ARCHITECTURE.md §8](ARCHITECTURE.md#8-fases-de-entrega). Resumo do que cad
 
 | Fase | Onde |
 |---|---|
-| 2 — Dados reais | ✅ esquema (`db/models.py`, `0002`, `0003`) · ✅ importação CSV (`ingest/`, `jobs/import_csv.py`) · pendente: `api/` (CRUD) |
+| 2 — Dados reais | ✅ esquema (`db/models.py`, `0002`, `0003`) · ✅ importação CSV (`ingest/`, `jobs/import_csv.py`) · ✅ API (`api/`) · pendente: cadastrar candidatos reais |
 | 3 — Histórico | `analytics/` (variação entre snapshots, cobertura) e rotas de consulta |
 | 4 — Triagem | `analytics/` (score versionado), reviews, ofertas de fornecedor |
 | 5 — Interface | dashboard e conectores autorizados |

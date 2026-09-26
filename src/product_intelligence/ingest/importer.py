@@ -8,7 +8,9 @@ Fluxo por arquivo (uma única transação):
      repetidos). Nomes apenas parecidos NÃO são unidos; nome repetido no banco = erro.
      Se não existir, cria.
    - fonte: upsert por (source_type, URL normalizada); preenche só campos vazios.
-   - associação candidato ↔ fonte: cria se não existir.
+   - associação candidato ↔ fonte: cria se não existir; relação divergente = erro.
+   As regras de candidato, fonte, associação e observação ficam em
+   `product_intelligence.domain` e são as mesmas usadas pela API.
    - observação: única por (fonte, observed_at). Já existente com os mesmos valores =
      duplicada (ignorada); com valores diferentes = erro (observações são imutáveis).
 4. Atualiza contadores e status e faz commit. Em erro inesperado: rollback de tudo e
@@ -26,9 +28,7 @@ import io
 import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -36,27 +36,23 @@ from product_intelligence.db.enums import CaptureMethod, ImportStatus
 from product_intelligence.db.models import (
     ImportBatch,
     ImportRowError,
-    Observation,
     ProductCandidate,
-    ProductSource,
     SourceItem,
+)
+from product_intelligence.domain import (
+    COMPARED_OBSERVATION_FIELDS,
+    SOURCE_FILL_FIELDS,
+    get_or_create_source,
+    link_product_source,
+    name_key,
+    products_with_name,
+    record_observation,
 )
 from product_intelligence.ingest.rows import ParsedRow, RowError, check_header, parse_row
 
 logger = logging.getLogger(__name__)
 
 MAX_FILE_BYTES = 20 * 1024 * 1024
-_COMPARED_FIELDS = (
-    "market_region",
-    "region_basis",
-    "views",
-    "likes",
-    "comments_count",
-    "shares",
-    "observed_price_usd",
-    "note",
-)
-_SOURCE_FILL_FIELDS = ("external_id", "title", "creator_handle", "published_at")
 
 
 class FileRejected(Exception):
@@ -102,19 +98,14 @@ def _find_product(session: Session, row: ParsedRow) -> tuple[ProductCandidate, b
         product = session.get(ProductCandidate, row.product_id)
         if product is None:
             raise RowError([f"product_id: {row.product_id} não existe"])
-        if " ".join(product.name.split()).lower() != row.product_name.lower():
+        if name_key(product.name) != name_key(row.product_name):
             raise RowError([
                 f"product_id {row.product_id} é '{product.name}', "
                 f"mas a linha diz '{row.product_name}'"
             ])
         return product, False
 
-    # A mesma comparação precisa considerar TODOS os candidatos; uma pré-seleção
-    # por lower(name) pode ocultar um segundo candidato com espaços repetidos.
-    matches = [
-        p for p in session.scalars(select(ProductCandidate))
-        if " ".join(p.name.split()).lower() == row.product_name.lower()
-    ]
+    matches = products_with_name(session, row.product_name)
     if len(matches) > 1:
         ids = ", ".join(str(p.id) for p in matches)
         raise RowError([
@@ -130,90 +121,28 @@ def _find_product(session: Session, row: ParsedRow) -> tuple[ProductCandidate, b
 
 
 def _upsert_source(session: Session, row: ParsedRow) -> tuple[SourceItem, bool]:
-    item = session.scalars(
-        select(SourceItem).where(
-            SourceItem.source_type == row.source_type,
-            SourceItem.external_url == row.source_url,
-        )
-    ).one_or_none()
-    if item is None:
-        # A versão anterior ordenava/recodificava a query e removia todas as rotas #.
-        # Não unir fontes por essa regra insegura nem duplicar silenciosamente dados antigos.
-        parts = urlsplit(row.source_url)
-        old_query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)), doseq=True)
-        old_url = urlunsplit((parts.scheme, parts.netloc, parts.path, old_query, ""))
-        if old_url != row.source_url:
-            legacy = session.scalar(select(SourceItem.id).where(
-                SourceItem.source_type == row.source_type, SourceItem.external_url == old_url,
-            ))
-            if legacy is not None:
-                raise RowError([
-                    f"source_url: possível normalização antiga na fonte {legacy}; "
-                    "revise a URL original antes de importar para evitar duplicação "
-                    "ou união incorreta"
-                ])
-        item = SourceItem(
-            source_type=row.source_type,
-            external_url=row.source_url,
-            **{name: getattr(row, name) for name in _SOURCE_FILL_FIELDS},
-        )
-        session.add(item)
-        session.flush()
-        return item, True
-    for name in _SOURCE_FILL_FIELDS:  # só completa; nunca sobrescreve o que já existe
-        if getattr(item, name) is None and getattr(row, name) is not None:
-            setattr(item, name, getattr(row, name))
-    return item, False
+    return get_or_create_source(
+        session, row.source_type, row.source_url,
+        {name: getattr(row, name) for name in SOURCE_FILL_FIELDS},
+    )
 
 
 def _link(session: Session, product: ProductCandidate, item: SourceItem, row: ParsedRow) -> None:
-    existing = session.get(ProductSource, (product.id, item.id))
-    if existing is None:
-        session.add(ProductSource(product_id=product.id, source_item_id=item.id,
-                                  relation=row.relation))
-        session.flush()
-    elif existing.relation != row.relation:
-        raise RowError(["relation: associação existente tem relação diferente; revise manualmente"])
+    link_product_source(session, product.id, item.id, row.relation)
 
 
 def _observation(
     session: Session, item: SourceItem, row: ParsedRow, batch: ImportBatch, row_number: int
 ) -> bool:
     """Grava a observação. Devolve False se for duplicada idêntica; RowError se conflitar."""
-    existing = session.scalars(
-        select(Observation).where(
-            Observation.source_item_id == item.id,
-            Observation.observed_at == row.observed_at,
-        )
-    ).one_or_none()
-    if existing is not None:
-        diffs = [
-            name for name in _COMPARED_FIELDS if getattr(existing, name) != getattr(row, name)
-        ]
-        if diffs:
-            raise RowError([
-                f"já existe observação desta fonte em {row.observed_at.isoformat()} "
-                f"com valores diferentes ({', '.join(diffs)}); observações são imutáveis — "
-                "use outro observed_at para um novo snapshot"
-            ])
-        return False
-    session.add(Observation(
-        source_item_id=item.id,
-        observed_at=row.observed_at,
-        market_region=row.market_region,
-        region_basis=row.region_basis,
-        views=row.views,
-        likes=row.likes,
-        comments_count=row.comments_count,
-        shares=row.shares,
-        observed_price_usd=row.observed_price_usd,
+    _, created = record_observation(
+        session, item.id, row.observed_at,
+        {name: getattr(row, name) for name in COMPARED_OBSERVATION_FIELDS},
         capture_method=CaptureMethod.CSV,
-        note=row.note,
         import_batch_id=batch.id,
         import_row_number=row_number,
-    ))
-    session.flush()
-    return True
+    )
+    return created
 
 
 def import_csv(
