@@ -1,2 +1,4 @@
-# Auto detect text files and perform LF normalization
+# Scripts shell precisam de LF para rodar na VM Linux, mesmo se editados no Windows.
 * text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf

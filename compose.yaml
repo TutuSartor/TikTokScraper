@@ -1,0 +1,61 @@
+name: product-intelligence
+
+x-db-env: &db-env
+  POSTGRES_USER: ${POSTGRES_USER:?defina POSTGRES_USER no .env}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?defina POSTGRES_PASSWORD no .env}
+  POSTGRES_DB: ${POSTGRES_DB:?defina POSTGRES_DB no .env}
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment: *db-env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Sem "ports": o banco só é acessível pela rede interna do Compose.
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    environment:
+      <<: *db-env
+      POSTGRES_HOST: db
+      APP_ENV: ${APP_ENV:-production}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Apenas localhost. Para acesso remoto, colocar autenticação + HTTPS antes (ver README).
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: dev
+    environment:
+      # O teste de migração cria/remove um banco de nome aleatório neste servidor.
+      <<: *db-env
+      POSTGRES_HOST: db
+      TEST_POSTGRES: "1"
+      APP_ENV: test
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
