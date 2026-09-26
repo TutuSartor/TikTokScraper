@@ -31,5 +31,7 @@ FROM base AS dev
 USER root
 RUN pip install ".[dev]"
 COPY tests ./tests
+# Os testes de backup/restore executam os scripts (com um "docker" falso).
+COPY scripts ./scripts
 USER app
 CMD ["pytest"]
