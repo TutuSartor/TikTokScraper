@@ -1,10 +1,12 @@
-"""Camada de banco: base declarativa, sessões e (a partir da Fase 2) modelos e repositórios.
+"""Camada de banco: base declarativa, sessões, modelos e vocabulários.
 
-Convenção para a Fase 2:
-- Modelos em `db/models.py` (ou `db/models/<entidade>.py`), herdando de `Base`.
-- Importar os modelos em `db/models/__init__.py` para que o Alembic os enxergue
-  (migrations/env.py importa `product_intelligence.db.models` se existir).
-- Toda mudança de esquema vira uma revisão: `alembic revision --autogenerate -m "..."`.
+- `base.py`    — Base declarativa com convenção de nomes de constraints.
+- `session.py` — engine, `get_session()` para as rotas.
+- `enums.py`   — vocabulários controlados (source_type, region_basis, ...).
+- `models.py`  — tabelas do domínio (ARCHITECTURE.md §4) e auditoria de importação (§5).
+
+Toda mudança de esquema vira uma revisão: `alembic revision --autogenerate -m "..."`,
+revisada à mão. `tests/test_models.py` falha se modelos e migrações divergirem.
 """
 
 from product_intelligence.db.base import Base

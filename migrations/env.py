@@ -9,6 +9,7 @@ from sqlalchemy import engine_from_config, pool
 
 from product_intelligence.config import get_settings
 from product_intelligence.db.base import Base
+from product_intelligence.db.types import UTCDateTime
 
 config = context.config
 
@@ -27,6 +28,14 @@ if importlib.util.find_spec("product_intelligence.db.models") is not None:
 target_metadata = Base.metadata
 
 
+def render_item(type_, obj, autogen_context):
+    # A validação de UTC é Python; no banco continua sendo TIMESTAMP WITH TIME ZONE.
+    # Evita gerar referências ao tipo customizado sem import nas próximas revisões.
+    if type_ == "type" and isinstance(obj, UTCDateTime):
+        return "sa.DateTime(timezone=True)"
+    return False
+
+
 def run_migrations_offline() -> None:
     context.configure(
         url=config.get_main_option("sqlalchemy.url"),
@@ -34,6 +43,7 @@ def run_migrations_offline() -> None:
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
         compare_type=True,
+        render_item=render_item,
     )
     with context.begin_transaction():
         context.run_migrations()
@@ -46,7 +56,10 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as connection:
-        context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+        context.configure(
+            connection=connection, target_metadata=target_metadata,
+            compare_type=True, render_item=render_item,
+        )
         with context.begin_transaction():
             context.run_migrations()
 

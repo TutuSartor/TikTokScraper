@@ -18,7 +18,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Product Intelligence",
         version=__version__,
-        description="Registro de candidatos a produto e evidências datadas. Fase 1: fundação.",
+        description="Registro de candidatos a produto e evidências datadas.",
     )
     app.include_router(api_router)
     return app

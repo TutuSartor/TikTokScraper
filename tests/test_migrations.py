@@ -6,6 +6,7 @@ Somente o banco criado pelo teste é removido ao final.
 """
 
 import os
+import shutil
 from io import StringIO
 from pathlib import Path
 from uuid import uuid4
@@ -13,11 +14,14 @@ from uuid import uuid4
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.operations import ops
 from alembic.script import ScriptDirectory
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import Column, MetaData, Table, create_engine, inspect, text
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import IntegrityError
 
 from product_intelligence.config import Settings, get_settings
+from product_intelligence.db.types import UTCDateTime
 
 TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 TEST_POSTGRES = os.environ.get("TEST_POSTGRES") == "1"
@@ -111,3 +115,49 @@ def test_migration_roundtrip_locally(tmp_path):
     assert _current_revision(url) is None
     command.upgrade(cfg, "head")
     assert _current_revision(url) == head
+
+
+def test_integrity_upgrade_preserves_existing_observation(tmp_path):
+    url = f"sqlite:///{(tmp_path / 'existing.db').as_posix()}"
+    cfg = _alembic_config(url)
+    command.upgrade(cfg, "0002")
+    engine = create_engine(url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("INSERT INTO source_item (id, source_type, external_url)"
+                              " VALUES (1, 'other', 'https://example.com/item')"))
+            conn.execute(text("INSERT INTO observation"
+                              " (id, source_item_id, observed_at, capture_method, views)"
+                              " VALUES (1, 1, '2026-09-26 12:00:00', 'manual', 10)"))
+        command.upgrade(cfg, "head")
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT views, likes FROM observation")).one() == (10, None)
+        with pytest.raises(IntegrityError, match="immutable"), engine.begin() as conn:
+            conn.execute(text("UPDATE observation SET views = 20 WHERE id = 1"))
+        command.downgrade(cfg, "0002")
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE observation SET views = 20 WHERE id = 1"))
+        command.upgrade(cfg, "head")
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT views FROM observation")).scalar_one() == 20
+    finally:
+        engine.dispose()
+
+
+def test_autogenerate_renders_utc_dates_as_native_sql_type(tmp_path):
+    migrations = tmp_path / "migrations"
+    shutil.copytree(ROOT / "migrations", migrations)
+    cfg = _alembic_config(f"sqlite:///{(tmp_path / 'autogen.db').as_posix()}")
+    cfg.set_main_option("script_location", str(migrations))
+    command.upgrade(cfg, "head")
+
+    def add_table(context, revision, directives):
+        table = Table("example", MetaData(), Column("observed_at", UTCDateTime()))
+        directives[0].upgrade_ops.ops.append(ops.CreateTableOp.from_table(table))
+
+    result = command.revision(
+        cfg, message="utc date", autogenerate=True, process_revision_directives=add_table
+    )
+    source = Path(result.path).read_text(encoding="utf-8")
+    assert "sa.DateTime(timezone=True)" in source
+    assert "product_intelligence.db.types.UTCDateTime" not in source
